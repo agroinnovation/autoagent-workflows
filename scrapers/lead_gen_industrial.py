@@ -48,7 +48,9 @@ def fetch_parcels(limit: Optional[int] = None, offset_pin: Optional[str] = None)
         SELECT "PIN", "STREETNUMB", "STREETNAME", "STREETDESI", "STREETQUAD",
                "LandUseCat", "LandUseDes"
         FROM business_parcels_target
-        WHERE "STREETNUMB" != 99999
+        WHERE "STREETNUMB" NOT IN (0, 99999)
+          AND "STREETNAME" IS NOT NULL
+          AND "STREETNAME" != ''
     '''
 
     if offset_pin:
@@ -120,6 +122,44 @@ def search_address(address: str) -> list[dict]:
         return []
 
 
+def enrich_results(results: list[dict], address: str, parcel: dict) -> tuple[list[dict], bool]:
+    """Enrich search results using LLM filtering.
+
+    Returns:
+        Tuple of (enriched_results, llm_used)
+    """
+    if not results:
+        return results, False
+
+    try:
+        response = requests.post(
+            f"{API_BASE}/crm/enrich",
+            json={
+                "results": results,
+                "address": address,
+                "parcel_context": {
+                    "pin": parcel.get("PIN"),
+                    "land_use_category": parcel.get("LandUseCat"),
+                    "land_use_description": parcel.get("LandUseDes")
+                }
+            },
+            timeout=90  # Allow time for LLM processing
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("llm_used"):
+            logger.info(f"  LLM enriched: {data.get('relevant_count')}/{data.get('total_count')} relevant")
+            return data.get("enriched_results", results), True
+        else:
+            logger.debug(f"  LLM not used: {data.get('error', 'unknown')}")
+            return results, False
+
+    except requests.RequestException as e:
+        logger.warning(f"Enrichment failed, using regex fallback: {e}")
+        return results, False
+
+
 def extract_phone(text: str) -> Optional[str]:
     """Extract phone number from text."""
     patterns = [
@@ -140,36 +180,59 @@ def extract_email(text: str) -> Optional[str]:
     return match.group() if match else None
 
 
-def parse_results(results: list[dict], parcel: dict, address: str, query: str) -> list[dict]:
-    """Parse search results into business records."""
+def parse_results(results: list[dict], parcel: dict, address: str, query: str, enriched: bool = False) -> list[dict]:
+    """Parse search results into business records.
+
+    Args:
+        results: Search results (optionally LLM-enriched)
+        parcel: Parcel data
+        address: Formatted address string
+        query: Original search query
+        enriched: If True, use LLM-extracted fields; otherwise use regex
+    """
     businesses = []
 
     for result in results:
         title = result.get("title", "")
         content = result.get("content", "")
         url = result.get("url", "")
-        score = result.get("score", 0.0)
 
         # Skip empty results
         if not title and not content:
             continue
 
-        # Combine title and content for extraction
-        full_text = f"{title} {content}"
+        # Use LLM-extracted data if available, otherwise fall back to regex
+        if enriched:
+            business_name = result.get("business_name") or title
+            phone = result.get("phone")
+            email = result.get("email")
+            website = result.get("website") or url
+            business_type = result.get("business_type")
+            confidence = result.get("relevance_score", 0.0)
+        else:
+            # Fall back to regex extraction
+            full_text = f"{title} {content}"
+            business_name = title
+            phone = extract_phone(full_text)
+            email = extract_email(full_text)
+            website = url
+            business_type = None
+            score = result.get("score", 0.0)
+            confidence = min(score, 1.0) if score else 0.0
 
         business = {
             "pin": parcel.get("PIN"),
             "address": address,
-            "business_name": title[:255] if title else None,
-            "phone": extract_phone(full_text),
-            "email": extract_email(full_text),
-            "website": url[:500] if url else None,
-            "business_type": None,  # Could be extracted with more NLP
+            "business_name": business_name[:255] if business_name else None,
+            "phone": phone,
+            "email": email,
+            "website": website[:500] if website else None,
+            "business_type": business_type,
             "search_query": query[:255],
             "result_url": url[:500] if url else None,
             "result_title": title[:255] if title else None,
             "result_snippet": content[:1000] if content else None,
-            "confidence_score": min(score, 1.0) if score else 0.0,
+            "confidence_score": confidence,
             "land_use_category": parcel.get("LandUseCat"),
             "land_use_description": parcel.get("LandUseDes"),
         }
@@ -289,8 +352,11 @@ def main():
         results = search_address(address)
 
         if results:
+            # Enrich results with LLM
+            enriched_results, llm_used = enrich_results(results, address, parcel)
+
             # Parse and save results
-            businesses = parse_results(results, parcel, address, query)
+            businesses = parse_results(enriched_results, parcel, address, query, enriched=llm_used)
 
             for biz in businesses:
                 if save_business(biz):
@@ -298,7 +364,7 @@ def main():
                 else:
                     total_errors += 1
 
-            logger.info(f"  -> Found {len(businesses)} results")
+            logger.info(f"  -> Found {len(businesses)} results (LLM: {llm_used})")
         else:
             logger.info(f"  -> No results found")
 
