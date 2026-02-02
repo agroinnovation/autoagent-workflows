@@ -29,7 +29,7 @@ except ImportError:
 
 # Configuration
 API_BASE = "http://192.168.1.17:8006"
-RATE_LIMIT = 1.0  # seconds between requests
+RATE_LIMIT = 10.0  # seconds between requests (slow to avoid upstream CAPTCHAs)
 CHECKPOINT_FILE = "/tmp/lead_gen_checkpoint.json"
 MAX_RESULTS_PER_PARCEL = 5  # Limit results to store per parcel
 
