@@ -235,6 +235,7 @@ def parse_results(results: list[dict], parcel: dict, address: str, query: str, e
             "confidence_score": confidence,
             "land_use_category": parcel.get("LandUseCat"),
             "land_use_description": parcel.get("LandUseDes"),
+            "enrichment_method": "llm" if enriched else "regex",
         }
         businesses.append(business)
 
