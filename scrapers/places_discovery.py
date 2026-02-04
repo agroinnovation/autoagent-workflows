@@ -41,9 +41,19 @@ MAX_RESULTS = 5
 COST_NEARBY = 0.032  # $32 per 1K for Nearby Search (New)
 COST_DETAILS = 0.017  # $17 per 1K for Place Details (Basic)
 
-# Default SQL query for parcels with coordinates
-# Note: query must output columns: pin, lat, lng
+# Default SQL query for facilities with addresses
+# Note: query must output columns: facility_id, pin, address
+# Uses facility layer to avoid duplicate API calls for shared addresses
 DEFAULT_QUERY = """
+    SELECT
+        facility_id,
+        pin,
+        CONCAT(address, ', ', city, ', ', state) as address
+    FROM crm.business_targets_v
+"""
+
+# Legacy query using lat/lng for backward compatibility
+LEGACY_QUERY = """
     SELECT
         "PIN" as pin,
         ST_Y(ST_Centroid(geometry)) as lat,
@@ -98,6 +108,79 @@ class CostTracker:
 # Google Places API Functions
 # ============================================================================
 
+def search_places_by_address(
+    address: str,
+    max_results: int = 5,
+    cost_tracker: Optional[CostTracker] = None
+) -> list[dict]:
+    """
+    Search for places by address using Places API Text Search.
+
+    Args:
+        address: Street address to search (e.g., "123 Main St, Albuquerque, NM")
+        max_results: Max places to return (default 5)
+        cost_tracker: Optional cost tracker
+
+    Returns:
+        List of parsed place dictionaries
+    """
+    payload = {
+        "query": f"businesses at {address}",
+        "max_results": max_results
+    }
+
+    try:
+        response = requests.post(
+            f"{API_BASE}/places/search",
+            json=payload,
+            timeout=30
+        )
+
+        # Track cost (text search uses same tier as nearby)
+        if cost_tracker:
+            cost_tracker.add_nearby()
+
+        # Handle rate limiting with retry
+        if response.status_code == 429:
+            for delay in [1, 5, 30]:
+                logger.warning(f"Rate limited, waiting {delay}s...")
+                time.sleep(delay)
+                response = requests.post(
+                    f"{API_BASE}/places/search",
+                    json=payload,
+                    timeout=30
+                )
+                if cost_tracker:
+                    cost_tracker.add_nearby()
+                if response.status_code != 429:
+                    break
+            else:
+                logger.error("Rate limit exceeded after retries")
+                return []
+
+        response.raise_for_status()
+        data = response.json()
+
+        if not data.get("success"):
+            logger.warning(f"Places API error: {data.get('message')}")
+            return []
+
+        places = data.get("places", [])
+        logger.debug(f"Places API returned {len(places)} places for address: {address}")
+
+        return places
+
+    except requests.Timeout:
+        logger.warning(f"Places API timed out for address: {address}")
+        return []
+    except requests.RequestException as e:
+        logger.warning(f"Places API request failed for address: {address}: {e}")
+        return []
+    except (ValueError, KeyError) as e:
+        logger.warning(f"Failed to parse Places API response: {e}")
+        return []
+
+
 def search_places_nearby(
     lat: float,
     lng: float,
@@ -106,7 +189,7 @@ def search_places_nearby(
     cost_tracker: Optional[CostTracker] = None
 ) -> list[dict]:
     """
-    Search for places near coordinates using Places API.
+    Search for places near coordinates using Places API (legacy method).
 
     Args:
         lat: Latitude
@@ -220,7 +303,7 @@ def get_place_details(
         return None
 
 
-def parse_place_to_business(place: dict, pin: str) -> dict:
+def parse_place_to_business(place: dict, pin: str, facility_id: str = None) -> dict:
     """
     Map a Places API response to a crm.businesses record.
 
@@ -288,6 +371,7 @@ def parse_place_to_business(place: dict, pin: str) -> dict:
 
     return {
         "pin": pin,
+        "facility_id": facility_id,
         "business_name": name[:255] if name else None,
         "phone": phone,
         "email": None,  # Places API doesn't provide email
@@ -318,9 +402,9 @@ def parse_place_to_business(place: dict, pin: str) -> dict:
 def fetch_parcels(
     query: str,
     limit: Optional[int] = None,
-    offset_pin: Optional[str] = None
+    offset_facility: Optional[str] = None
 ) -> list[dict]:
-    """Fetch parcels using provided SQL query."""
+    """Fetch parcels/facilities using provided SQL query."""
     sql = query.strip()
 
     # Remove trailing semicolon if present
@@ -328,8 +412,8 @@ def fetch_parcels(
 
     # Build clauses
     clauses = []
-    if offset_pin:
-        clauses.append(f"\"PIN\" > '{offset_pin}'")
+    if offset_facility:
+        clauses.append(f"facility_id > '{offset_facility}'")
 
     # Add WHERE clause if we have conditions
     if clauses:
@@ -338,7 +422,7 @@ def fetch_parcels(
         else:
             sql += f" WHERE {' AND '.join(clauses)}"
 
-    sql += " ORDER BY \"PIN\""
+    sql += " ORDER BY facility_id"
 
     if limit:
         sql += f" LIMIT {limit}"
@@ -426,6 +510,7 @@ def save_business(business: dict) -> bool:
         INSERT INTO crm.businesses ({", ".join(columns)})
         VALUES ({", ".join(placeholders)})
         ON CONFLICT (pin, result_url) DO UPDATE SET
+            facility_id = EXCLUDED.facility_id,
             business_name = EXCLUDED.business_name,
             phone = EXCLUDED.phone,
             website = EXCLUDED.website,
@@ -472,12 +557,12 @@ def load_checkpoint() -> Optional[dict]:
         return None
 
 
-def save_checkpoint(pin: str, stats: dict, cost_tracker: CostTracker) -> None:
-    """Save checkpoint with last processed PIN, stats, and cost info."""
+def save_checkpoint(facility_id: str, stats: dict, cost_tracker: CostTracker) -> None:
+    """Save checkpoint with last processed facility_id, stats, and cost info."""
     try:
         with open(CHECKPOINT_FILE, 'w') as f:
             json.dump({
-                "last_pin": pin,
+                "last_facility": facility_id,
                 "timestamp": datetime.now().isoformat(),
                 "stats": stats,
                 "cost": {
@@ -499,28 +584,56 @@ def process_parcel(
     radius: int,
     max_results: int,
     enrich: bool,
-    cost_tracker: CostTracker
+    cost_tracker: CostTracker,
+    use_address: bool = True
 ) -> list[dict]:
     """
-    Query Places API for businesses near a parcel.
+    Query Places API for businesses at/near a facility/parcel.
+
+    Args:
+        parcel: Dict with 'facility_id', 'pin' and either 'address' or 'lat'/'lng'
+        radius: Search radius in meters (only used for lat/lng mode)
+        max_results: Max places to return
+        enrich: Whether to call details API
+        cost_tracker: Cost tracker instance
+        use_address: If True, use address-based text search (default)
+                     If False, use legacy lat/lng nearby search
 
     Returns list of business records ready for save_business().
     """
     pin = parcel.get("pin")
-    lat = parcel.get("lat")
-    lng = parcel.get("lng")
+    facility_id = parcel.get("facility_id")
 
-    if lat is None or lng is None:
-        logger.warning(f"PIN {pin}: Missing coordinates, skipping")
-        return []
+    if use_address:
+        # Address-based text search (preferred)
+        address = parcel.get("address")
+        if not address or address.strip() == "":
+            logger.warning(f"PIN {pin}: Missing address, skipping")
+            return []
 
-    # Query Places API
-    places = search_places_nearby(
-        lat, lng,
-        radius=radius,
-        max_results=max_results,
-        cost_tracker=cost_tracker
-    )
+        # Clean up address (remove extra spaces)
+        address = " ".join(address.split())
+
+        places = search_places_by_address(
+            address,
+            max_results=max_results,
+            cost_tracker=cost_tracker
+        )
+    else:
+        # Legacy lat/lng nearby search
+        lat = parcel.get("lat")
+        lng = parcel.get("lng")
+
+        if lat is None or lng is None:
+            logger.warning(f"PIN {pin}: Missing coordinates, skipping")
+            return []
+
+        places = search_places_nearby(
+            lat, lng,
+            radius=radius,
+            max_results=max_results,
+            cost_tracker=cost_tracker
+        )
 
     if not places:
         return []
@@ -536,7 +649,7 @@ def process_parcel(
                 if details:
                     place.update(details)
 
-        business = parse_place_to_business(place, pin)
+        business = parse_place_to_business(place, pin, facility_id)
         if business.get("business_name"):  # Only include named places
             businesses.append(business)
 
@@ -548,46 +661,54 @@ def main():
     parser.add_argument("--test", action="store_true", help="Test mode: process only 10 parcels")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     parser.add_argument("--limit", type=int, help="Limit number of parcels to process")
-    parser.add_argument("--query", type=str, help="Custom SQL query for parcels (must return pin, lat, lng)")
-    parser.add_argument("--radius", type=int, default=DEFAULT_RADIUS, help=f"Search radius in meters (default: {DEFAULT_RADIUS})")
+    parser.add_argument("--query", type=str, help="Custom SQL query for parcels (must return pin, address)")
+    parser.add_argument("--radius", type=int, default=DEFAULT_RADIUS, help=f"Search radius in meters (default: {DEFAULT_RADIUS}, only for legacy mode)")
     parser.add_argument("--max-results", type=int, default=MAX_RESULTS, help=f"Max places per parcel (default: {MAX_RESULTS})")
     parser.add_argument("--enrich", action="store_true", help="Call details API for each place (costs more)")
     parser.add_argument("--cost-limit", type=float, help="Stop at estimated cost threshold (e.g., 5.00)")
+    parser.add_argument("--legacy", action="store_true", help="Use legacy lat/lng nearby search instead of address-based text search")
     args = parser.parse_args()
 
     # Determine limit
     limit = 10 if args.test else args.limit
 
-    # Use custom query or default
-    query = args.query if args.query else DEFAULT_QUERY
+    # Determine search mode
+    use_address = not args.legacy
+
+    # Use custom query or default (different defaults for address vs legacy mode)
+    if args.query:
+        query = args.query
+    else:
+        query = DEFAULT_QUERY if use_address else LEGACY_QUERY
 
     # Initialize cost tracker
     cost_tracker = CostTracker(cost_limit=args.cost_limit)
 
     # Check for resume
-    offset_pin = None
+    offset_facility = None
     if args.resume:
         checkpoint = load_checkpoint()
         if checkpoint:
-            offset_pin = checkpoint.get("last_pin")
+            offset_facility = checkpoint.get("last_facility")
             # Restore cost tracking from checkpoint
             if "cost" in checkpoint:
                 cost_tracker.nearby_calls = checkpoint["cost"].get("nearby_calls", 0)
                 cost_tracker.details_calls = checkpoint["cost"].get("details_calls", 0)
-            logger.info(f"Resuming from PIN: {offset_pin}")
+            logger.info(f"Resuming from facility: {offset_facility}")
             logger.info(f"Previous cost: {cost_tracker.summary()}")
         else:
             logger.info("No checkpoint found, starting from beginning")
 
-    # Fetch parcels
-    logger.info("Fetching parcels...")
-    parcels = fetch_parcels(query=query, limit=limit, offset_pin=offset_pin)
+    # Fetch facilities
+    logger.info("Fetching facilities...")
+    parcels = fetch_parcels(query=query, limit=limit, offset_facility=offset_facility)
 
     if not parcels:
-        logger.error("No parcels to process")
+        logger.error("No facilities to process")
         return 1
 
-    logger.info(f"Processing {len(parcels)} parcels with {args.radius}m radius...")
+    search_mode = "address-based text search" if use_address else f"lat/lng nearby search ({args.radius}m radius)"
+    logger.info(f"Processing {len(parcels)} facilities with {search_mode}...")
     if args.enrich:
         logger.info("Enrichment enabled (details API will be called)")
     if args.cost_limit:
@@ -608,10 +729,17 @@ def main():
             break
 
         pin = parcel.get("pin")
-        lat = parcel.get("lat")
-        lng = parcel.get("lng")
+        facility_id = parcel.get("facility_id")
 
-        logger.info(f"[{i+1}/{len(parcels)}] PIN {pin}: ({lat:.6f}, {lng:.6f})")
+        # Log based on search mode
+        if use_address:
+            address = parcel.get("address", "").strip()
+            address_short = address[:50] + "..." if len(address) > 50 else address
+            logger.info(f"[{i+1}/{len(parcels)}] {facility_id}: {address_short}")
+        else:
+            lat = parcel.get("lat")
+            lng = parcel.get("lng")
+            logger.info(f"[{i+1}/{len(parcels)}] {facility_id}: ({lat:.6f}, {lng:.6f})")
 
         try:
             businesses = process_parcel(
@@ -619,7 +747,8 @@ def main():
                 args.radius,
                 args.max_results,
                 args.enrich,
-                cost_tracker
+                cost_tracker,
+                use_address=use_address
             )
 
             if businesses:
@@ -633,11 +762,11 @@ def main():
 
             stats["total_processed"] += 1
 
-            # Save checkpoint after each parcel
-            save_checkpoint(pin, stats, cost_tracker)
+            # Save checkpoint after each facility
+            save_checkpoint(facility_id, stats, cost_tracker)
 
         except Exception as e:
-            logger.error(f"  Error processing PIN {pin}: {e}")
+            logger.error(f"  Error processing {facility_id}: {e}")
             stats["errors"] += 1
 
         # Rate limit (except for last parcel)
@@ -648,8 +777,8 @@ def main():
     # Final summary
     logger.info("=" * 50)
     logger.info("Places Discovery Complete")
-    logger.info(f"  Parcels processed: {stats['total_processed']}")
-    logger.info(f"  Parcels with results: {stats['parcels_with_results']}")
+    logger.info(f"  Facilities processed: {stats['total_processed']}")
+    logger.info(f"  Facilities with results: {stats['parcels_with_results']}")
     logger.info(f"  Businesses discovered: {stats['total_businesses']}")
     logger.info(f"  Errors: {stats['errors']}")
     logger.info(f"  Cost: {cost_tracker.summary()}")
