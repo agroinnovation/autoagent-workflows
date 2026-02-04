@@ -19,10 +19,11 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 try:
     import requests
@@ -68,6 +69,86 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Address Matching
+# ============================================================================
+
+def parse_address(address: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract street number and normalized street name from an address.
+
+    Returns:
+        Tuple of (street_number, street_name) or (None, None) if parsing fails
+
+    Examples:
+        "6612 ACOMA RD SE" -> ("6612", "ACOMA RD SE")
+        "6608 Acoma Rd SE, Albuquerque, NM 87108, USA" -> ("6608", "ACOMA RD SE")
+    """
+    if not address:
+        return None, None
+
+    # Normalize: uppercase, remove extra spaces
+    addr = " ".join(address.upper().split())
+
+    # Remove city, state, zip suffix (everything after first comma)
+    if "," in addr:
+        addr = addr.split(",")[0].strip()
+
+    # Extract street number (first numeric token)
+    match = re.match(r'^(\d+)\s+(.+)$', addr)
+    if not match:
+        return None, None
+
+    street_num = match.group(1)
+    street_name = match.group(2).strip()
+
+    # Normalize street suffixes
+    street_name = re.sub(r'\bSTREET\b', 'ST', street_name)
+    street_name = re.sub(r'\bAVENUE\b', 'AV', street_name)
+    street_name = re.sub(r'\bAVE\b', 'AV', street_name)
+    street_name = re.sub(r'\bROAD\b', 'RD', street_name)
+    street_name = re.sub(r'\bBOULEVARD\b', 'BLVD', street_name)
+    street_name = re.sub(r'\bDRIVE\b', 'DR', street_name)
+    street_name = re.sub(r'\bLANE\b', 'LN', street_name)
+    street_name = re.sub(r'\bCOURT\b', 'CT', street_name)
+    street_name = re.sub(r'\bPLACE\b', 'PL', street_name)
+
+    # Remove unit/suite info
+    street_name = re.sub(r'\s+(UNIT|STE|SUITE|APT|#)\s*\S*$', '', street_name)
+
+    return street_num, street_name
+
+
+def addresses_match(facility_addr: str, business_addr: str, tolerance: int = 10) -> bool:
+    """
+    Check if a business address matches the facility address.
+
+    Args:
+        facility_addr: The facility/parcel address
+        business_addr: The business address from Places API
+        tolerance: Max difference in street numbers (for large buildings)
+
+    Returns:
+        True if addresses match within tolerance
+    """
+    fac_num, fac_street = parse_address(facility_addr)
+    biz_num, biz_street = parse_address(business_addr)
+
+    if not all([fac_num, fac_street, biz_num, biz_street]):
+        return False
+
+    # Street names must match
+    if fac_street != biz_street:
+        return False
+
+    # Street numbers must be within tolerance
+    try:
+        num_diff = abs(int(fac_num) - int(biz_num))
+        return num_diff <= tolerance
+    except ValueError:
+        return fac_num == biz_num
 
 
 # ============================================================================
@@ -638,9 +719,26 @@ def process_parcel(
     if not places:
         return []
 
+    # Filter to only businesses that match the facility address
+    facility_addr = parcel.get("address", "")
+    matched_places = []
+    for place in places:
+        biz_addr = place.get("address") or place.get("formatted_address") or ""
+        if addresses_match(facility_addr, biz_addr):
+            matched_places.append(place)
+        else:
+            biz_name = place.get("name", "Unknown")
+            logger.debug(f"  Filtered out '{biz_name}' - address mismatch: {biz_addr}")
+
+    if not matched_places:
+        logger.debug(f"  No businesses matched facility address")
+        return []
+
+    logger.info(f"  {len(matched_places)}/{len(places)} businesses matched address")
+
     # Convert to business records
     businesses = []
-    for place in places:
+    for place in matched_places:
         # Optionally enrich with details
         if enrich:
             place_id = place.get("place_id") or place.get("id")
