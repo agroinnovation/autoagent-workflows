@@ -43,7 +43,7 @@ except ImportError:
 
 # Configuration
 API_BASE = os.environ.get("API_BASE", "http://192.168.1.17:8006")
-SEARCH_DELAY = 2.0  # seconds between searches
+SEARCH_DELAY = 5.0  # seconds between searches (increased to avoid rate limits)
 SCRAPE_DELAY = 1.0  # seconds between page scrapes
 CHECKPOINT_FILE = "/tmp/lead_scout_checkpoint.json"
 DATA_DIR = Path(__file__).parent.parent.parent.parent / "data" / "leads"
@@ -92,14 +92,15 @@ def extract_city_from_address(address: str) -> str:
 # SearxNG Search
 # ============================================================================
 
-def search(query: str, num_results: int = 8) -> List[Dict[str, str]]:
+def search(query: str, num_results: int = 8, engines: str = "bing") -> List[Dict[str, str]]:
     """
     Search using SearxNG. Returns list of {title, content, url}.
+    Uses Bing by default as it's the most reliable engine (others rate-limited).
     """
     try:
         response = requests.get(
             f"{API_BASE}/searx/search",
-            params={"q": query, "num_results": num_results},
+            params={"q": query, "num_results": num_results, "engines": engines},
             timeout=30
         )
         response.raise_for_status()
