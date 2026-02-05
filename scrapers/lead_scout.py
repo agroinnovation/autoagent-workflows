@@ -46,7 +46,7 @@ API_BASE = os.environ.get("API_BASE", "http://192.168.1.17:8006")
 SEARCH_DELAY = 5.0  # seconds between searches (increased to avoid rate limits)
 SCRAPE_DELAY = 1.0  # seconds between page scrapes
 CHECKPOINT_FILE = "/tmp/lead_scout_checkpoint.json"
-DATA_DIR = Path(__file__).parent.parent.parent.parent / "data" / "leads"
+DATA_DIR = Path(__file__).parent.parent.parent / "leads" / "data" / "leads"
 
 # LLM Configuration
 DEFAULT_LLM_PROVIDER = "groq"  # or "ollama"
@@ -1006,14 +1006,14 @@ def generate_profile(
 
 
 def save_profile(slug: str, profile: str) -> str:
-    """Save profile to data/leads/{slug}/profile.md."""
+    """Save profile to projects/leads/data/leads/{slug}/profile.md."""
     profile_dir = DATA_DIR / slug
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     profile_path = profile_dir / "profile.md"
     profile_path.write_text(profile)
 
-    return f"data/leads/{slug}/profile.md"
+    return f"projects/leads/data/leads/{slug}/profile.md"
 
 
 def save_lead(slug: str, story: str, data: Dict) -> tuple[str, str]:
@@ -1040,7 +1040,7 @@ def save_lead(slug: str, story: str, data: Dict) -> tuple[str, str]:
     with open(data_path, 'w') as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
-    return f"data/leads/{slug}/profile.md", f"data/leads/{slug}/data.yaml"
+    return f"projects/leads/data/leads/{slug}/profile.md", f"projects/leads/data/leads/{slug}/data.yaml"
 
 
 def generate_story_profile(
