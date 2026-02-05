@@ -89,18 +89,17 @@ def extract_city_from_address(address: str) -> str:
 
 
 # ============================================================================
-# SearxNG Search
+# Serper Search (Google Search API)
 # ============================================================================
 
-def search(query: str, num_results: int = 8, engines: str = "bing") -> List[Dict[str, str]]:
+def search(query: str, num_results: int = 8) -> List[Dict[str, str]]:
     """
-    Search using SearxNG. Returns list of {title, content, url}.
-    Uses Bing by default as it's the most reliable engine (others rate-limited).
+    Search using Serper (Google Search API). Returns list of {title, content, url}.
     """
     try:
-        response = requests.get(
-            f"{API_BASE}/searx/search",
-            params={"q": query, "num_results": num_results, "engines": engines},
+        response = requests.post(
+            f"{API_BASE}/serper/search",
+            json={"query": query, "num": min(num_results, 100)},
             timeout=30
         )
         response.raise_for_status()
@@ -110,20 +109,17 @@ def search(query: str, num_results: int = 8, engines: str = "bing") -> List[Dict
             logger.warning(f"Search error: {data.get('error')}")
             return []
 
-        results_obj = data.get("results", {})
-        if isinstance(results_obj, dict):
-            results = results_obj.get("results", [])
-        else:
-            results = results_obj
+        # Serper returns organic results in 'organic' key
+        results = data.get("organic", [])
 
         return [
             {
                 "title": r.get("title", ""),
-                "content": r.get("content", ""),
-                "url": r.get("url", "")
+                "content": r.get("snippet", ""),  # Serper uses 'snippet' not 'content'
+                "url": r.get("link", "")  # Serper uses 'link' not 'url'
             }
             for r in results[:num_results]
-            if r.get("content")
+            if r.get("snippet")
         ]
 
     except Exception as e:
@@ -1168,7 +1164,7 @@ def generate_story_profile(
     sources = []
     if places_intel:
         sources.append("google_places")
-    sources.append("searxng")
+    sources.append("serper")
     sources.append("playwright")
 
     # Build profile markdown
