@@ -121,7 +121,7 @@ def parse_address(address: str) -> Tuple[Optional[str], Optional[str]]:
     return street_num, street_name
 
 
-def addresses_match(facility_addr: str, business_addr: str, tolerance: int = 10) -> bool:
+def addresses_match(facility_addr: str, business_addr: str, tolerance: int = 50) -> bool:
     """
     Check if a business address matches the facility address.
 
