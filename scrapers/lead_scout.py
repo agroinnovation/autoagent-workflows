@@ -6,7 +6,7 @@ Deep research on business leads using:
 - SearxNG: Targeted searches (ownership, history, services)
 - Playwright: Website scraping (/about, /team, /contact)
 - Groq/Ollama: LLM distillation of raw content into structured facts
-- Claude: Optional review of final profiles (separate step)
+- Gemini: Person enrichment with Google Search grounding
 
 Usage:
     python3 lead_scout.py --help           # Show help
@@ -153,19 +153,22 @@ def scrape_page(url: str) -> Optional[str]:
         return None
 
     try:
-        response = requests.post(
-            f"{API_BASE}/scraper/scrape-url",
-            json={"url": url, "timeout": 15000},
-            timeout=30
+        # Use the synchronous test-scrape endpoint (GET)
+        response = requests.get(
+            f"{API_BASE}/scraper/test-scrape",
+            params={"url": url},
+            timeout=45
         )
         response.raise_for_status()
         data = response.json()
 
-        if data.get("success"):
-            content = data.get("content", "")
+        if data.get("scrape_status") == "success":
+            content = data.get("clean_text", "")
             # Limit content size for LLM processing
             return content[:8000] if content else None
-        return None
+        else:
+            logger.debug(f"Scrape failed: {data.get('error_message')}")
+            return None
 
     except Exception as e:
         logger.debug(f"Scrape failed for {url}: {e}")
@@ -479,7 +482,6 @@ def generate_profile(
 - **Quality Flags:** {', '.join(quality_flags) if quality_flags else 'none'}
 - **Sources:** SearxNG search, Gemini grounded search
 - **LLM:** Groq distillation + Gemini 2.0 Flash
-- **Review Status:** Pending
 """
     return profile
 
@@ -692,7 +694,7 @@ def main():
     parser.add_argument("--limit", type=int, help="Limit number of leads")
     parser.add_argument("--id", type=int, help="Scout specific business by ID")
     parser.add_argument("--provider", default=DEFAULT_LLM_PROVIDER,
-                        choices=["groq", "ollama"], help="LLM provider")
+                        choices=["groq", "ollama"], help="LLM provider for distillation")
     args = parser.parse_args()
 
     limit = 1 if args.test else args.limit
