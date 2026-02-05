@@ -35,6 +35,12 @@ except ImportError:
     print("Error: requests library required. Install with: pip install requests")
     sys.exit(1)
 
+try:
+    import yaml
+except ImportError:
+    print("Error: pyyaml library required. Install with: pip install pyyaml")
+    sys.exit(1)
+
 # Configuration
 API_BASE = os.environ.get("API_BASE", "http://192.168.1.17:8006")
 SEARCH_DELAY = 2.0  # seconds between searches
@@ -44,8 +50,11 @@ DATA_DIR = Path(__file__).parent.parent.parent.parent / "data" / "leads"
 
 # LLM Configuration
 DEFAULT_LLM_PROVIDER = "groq"  # or "ollama"
-LLM_TEMPERATURE = 0.1
+LLM_TEMPERATURE = 0.1  # Default (backward compat)
+LLM_STORY_TEMP = 0.35  # Higher temp for narrative creativity
+LLM_EXTRACT_TEMP = 0.1  # Low temp for deterministic extraction
 LLM_MAX_TOKENS = 1500
+LLM_STORY_MAX_TOKENS = 2000  # Allow longer story responses
 
 # Logging setup
 logging.basicConfig(
@@ -295,6 +304,36 @@ def enrich_person_with_gemini(
         return None
 
 
+def research_company_with_gemini(
+    company: str,
+    location: str = "Albuquerque, NM"
+) -> Optional[Dict[str, Any]]:
+    """
+    Use Gemini 2.0 Flash with Google Search grounding for company research.
+    Returns leadership, scale, history, news, priorities, and sales opportunities.
+    """
+    try:
+        response = requests.post(
+            f"{API_BASE}/gemini/research-company",
+            json={
+                "company": company,
+                "location": location
+            },
+            timeout=120
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Check if we got useful data
+        if data.get("leadership") or data.get("summary") or data.get("scale"):
+            return data
+        return None
+
+    except Exception as e:
+        logger.warning(f"Gemini company research failed: {e}")
+        return None
+
+
 # ============================================================================
 # LLM Distillation
 # ============================================================================
@@ -302,11 +341,23 @@ def enrich_person_with_gemini(
 def distill_with_llm(
     content: str,
     prompt: str,
-    provider: str = DEFAULT_LLM_PROVIDER
+    provider: str = DEFAULT_LLM_PROVIDER,
+    temperature: float = None,
+    max_tokens: int = None
 ) -> Optional[str]:
     """
     Use Groq/Ollama to distill raw content into structured facts.
+
+    Args:
+        content: Raw content to distill
+        prompt: System prompt for distillation
+        provider: LLM provider (groq or ollama)
+        temperature: Override default temperature (0.1)
+        max_tokens: Override default max tokens (1500)
     """
+    temp = temperature if temperature is not None else LLM_TEMPERATURE
+    tokens = max_tokens if max_tokens is not None else LLM_MAX_TOKENS
+
     try:
         response = requests.post(
             f"{API_BASE}/llm/chat",
@@ -316,8 +367,8 @@ def distill_with_llm(
                     {"role": "user", "content": content}
                 ],
                 "provider": provider,
-                "temperature": LLM_TEMPERATURE,
-                "max_tokens": LLM_MAX_TOKENS
+                "temperature": temp,
+                "max_tokens": tokens
             },
             timeout=60
         )
@@ -334,9 +385,123 @@ def distill_with_llm(
         return None
 
 
+def distill_search_story(intel: Dict[str, List[Dict]], provider: str) -> str:
+    """
+    Distill search results into narrative story with conversation hooks.
+    Returns markdown string for profile.md.
+    """
+    # Combine all search results into context
+    context_parts = []
+    for category, results in intel.items():
+        if results:
+            context_parts.append(f"=== {category.upper()} ===")
+            for r in results:
+                context_parts.append(f"[{r['title']}] {r['content']}")
+
+    if not context_parts:
+        return ""
+
+    context = "\n".join(context_parts)
+
+    prompt = """You are a sales researcher preparing a brief for a relationship manager.
+
+From the search results below, write a 2-3 paragraph STORY about this company:
+- Who runs it and what are their backgrounds?
+- How did they get here? What's their journey?
+- What makes them different from competitors?
+- What drives them? What do they care about?
+
+Write like you're briefing a colleague before a first meeting. Focus on the PEOPLE and their journey, not just business specs.
+
+After the story, suggest 3 specific CONVERSATION STARTERS - questions that show you did your homework and care about them as people, not just as a sale.
+
+Finally, list Quick Reference facts: founded, owners, team, services, licenses, reputation signals."""
+
+    logger.info("  Distilling search story...")
+    result = distill_with_llm(
+        context[:6000], prompt, provider,
+        temperature=LLM_STORY_TEMP, max_tokens=LLM_STORY_MAX_TOKENS
+    )
+    return result if result else ""
+
+
+def distill_search_structured(intel: Dict[str, List[Dict]], provider: str) -> Dict:
+    """
+    Distill search results into structured YAML data.
+    Returns dict for data.yaml.
+    """
+    # Combine all search results into context
+    context_parts = []
+    for category, results in intel.items():
+        if results:
+            context_parts.append(f"=== {category.upper()} ===")
+            for r in results:
+                context_parts.append(f"[{r['title']}] {r['content']}")
+
+    if not context_parts:
+        return {}
+
+    context = "\n".join(context_parts)
+
+    prompt = """Extract structured data from these search results into YAML format.
+
+Use this exact schema:
+```yaml
+company:
+  name:
+  founded:
+  acquired:
+leadership:
+  - name:
+    role:
+    background:
+team:
+  - name:
+    role:
+services:
+  - service
+licenses:
+  - license
+reputation:
+  signals:
+    - signal
+  differentiators:
+    - differentiator
+conversation_hooks:
+  - hook
+```
+
+Fill in what you find. Use null for missing fields. Be factual and precise.
+Only include information explicitly stated in the sources.
+Return ONLY the YAML, no markdown code blocks or explanation."""
+
+    logger.info("  Distilling search structured...")
+    result = distill_with_llm(
+        context[:6000], prompt, provider,
+        temperature=LLM_EXTRACT_TEMP, max_tokens=LLM_MAX_TOKENS
+    )
+
+    if not result:
+        return {}
+
+    # Parse YAML response
+    try:
+        # Strip markdown code blocks if present
+        yaml_text = result.strip()
+        if yaml_text.startswith("```"):
+            yaml_text = "\n".join(yaml_text.split("\n")[1:])
+        if yaml_text.endswith("```"):
+            yaml_text = "\n".join(yaml_text.split("\n")[:-1])
+        return yaml.safe_load(yaml_text) or {}
+    except yaml.YAMLError as e:
+        logger.warning(f"Failed to parse YAML: {e}")
+        return {}
+
+
 def distill_search_results(intel: Dict[str, List[Dict]], provider: str) -> Dict[str, str]:
     """
-    Distill search results into structured ownership/history facts.
+    DEPRECATED: Use distill_search_story() and distill_search_structured() instead.
+    Kept for backward compatibility.
     """
     # Combine all search results into context
     context_parts = []
@@ -369,9 +534,107 @@ Format as a clean markdown list. Be factual - only include what's explicitly sta
     return {"search_intel": result} if result else {}
 
 
+def distill_website_story(pages: Dict[str, str], provider: str) -> str:
+    """
+    Distill website content into business operations narrative.
+    Returns markdown string to append to profile.md.
+    """
+    if not pages:
+        return ""
+
+    # Combine page content
+    context_parts = []
+    for page_type, content in pages.items():
+        truncated = content[:3000] if len(content) > 3000 else content
+        context_parts.append(f"=== {page_type.upper()} PAGE ===\n{truncated}")
+
+    context = "\n\n".join(context_parts)
+
+    prompt = """You are summarizing a company's website for a sales brief.
+
+Write a 1-2 paragraph summary of how this business operates:
+- What services/products do they offer?
+- Who are their target customers?
+- What's their unique approach or value proposition?
+- Any culture, mission, or values that stand out?
+
+Write naturally, as if briefing a colleague. Focus on what makes them tick."""
+
+    logger.info("  Distilling website story...")
+    result = distill_with_llm(
+        context[:8000], prompt, provider,
+        temperature=LLM_STORY_TEMP, max_tokens=LLM_STORY_MAX_TOKENS
+    )
+    return result if result else ""
+
+
+def distill_website_structured(pages: Dict[str, str], provider: str) -> Dict:
+    """
+    Distill website content into structured data.
+    Returns dict to merge into data.yaml.
+    """
+    if not pages:
+        return {}
+
+    # Combine page content
+    context_parts = []
+    for page_type, content in pages.items():
+        truncated = content[:3000] if len(content) > 3000 else content
+        context_parts.append(f"=== {page_type.upper()} PAGE ===\n{truncated}")
+
+    context = "\n\n".join(context_parts)
+
+    prompt = """Extract structured data from this website content into YAML format.
+
+Use this schema:
+```yaml
+contact:
+  phone:
+  email:
+  address:
+  city:
+  state:
+  zip:
+services:
+  - service
+team:
+  - name:
+    role:
+certifications:
+  - certification
+values:
+  - value statement
+```
+
+Fill in what you find. Use null for missing fields. Be factual.
+Return ONLY the YAML, no markdown code blocks or explanation."""
+
+    logger.info("  Distilling website structured...")
+    result = distill_with_llm(
+        context[:8000], prompt, provider,
+        temperature=LLM_EXTRACT_TEMP, max_tokens=LLM_MAX_TOKENS
+    )
+
+    if not result:
+        return {}
+
+    # Parse YAML response
+    try:
+        yaml_text = result.strip()
+        if yaml_text.startswith("```"):
+            yaml_text = "\n".join(yaml_text.split("\n")[1:])
+        if yaml_text.endswith("```"):
+            yaml_text = "\n".join(yaml_text.split("\n")[:-1])
+        return yaml.safe_load(yaml_text) or {}
+    except yaml.YAMLError as e:
+        logger.warning(f"Failed to parse website YAML: {e}")
+        return {}
+
+
 def distill_website_content(pages: Dict[str, str], provider: str) -> Dict[str, str]:
     """
-    Distill website content into structured business info.
+    DEPRECATED: Use distill_website_story() and distill_website_structured() instead.
+    Kept for backward compatibility.
     """
     if not pages:
         return {}
@@ -410,7 +673,8 @@ def generate_profile(
     business: Dict,
     search_distilled: Dict[str, str],
     website_distilled: Dict[str, str],
-    person_intel: Optional[Dict[str, Any]] = None
+    person_intel: Optional[Dict[str, Any]] = None,
+    company_intel: Optional[Dict[str, Any]] = None
 ) -> str:
     """Generate rich markdown profile from distilled intel."""
 
@@ -429,6 +693,8 @@ def generate_profile(
 
     # Determine quality score based on what we found
     quality_flags = []
+    if company_intel:
+        quality_flags.append("gemini_research")
     if search_intel and search_intel != "No search intelligence gathered.":
         quality_flags.append("search_complete")
     if website_intel and website_intel != "Website not analyzed.":
@@ -438,10 +704,79 @@ def generate_profile(
 
     quality = "high" if len(quality_flags) >= 2 else "partial" if quality_flags else "minimal"
 
-    # Build owner/decision maker section from Gemini intel
+    # Build company research section from Gemini
+    company_section = ""
+    if company_intel:
+        company_section = "\n## Company Intelligence (Gemini Research)\n\n"
+
+        # Summary
+        if company_intel.get("summary"):
+            company_section += f"{company_intel['summary']}\n\n"
+
+        # Leadership
+        if company_intel.get("leadership"):
+            company_section += "### Leadership\n\n"
+            for leader in company_intel["leadership"]:
+                leader_name = leader.get("name", "Unknown")
+                leader_title = leader.get("title", "")
+                leader_bg = leader.get("background", "")
+                company_section += f"- **{leader_name}** - {leader_title}"
+                if leader_bg:
+                    company_section += f" ({leader_bg})"
+                company_section += "\n"
+            company_section += "\n"
+
+        # Scale
+        if company_intel.get("scale"):
+            scale = company_intel["scale"]
+            company_section += "### Scale & Footprint\n\n"
+            if scale.get("employees"):
+                company_section += f"- **Employees:** {scale['employees']}\n"
+            if scale.get("locations"):
+                company_section += f"- **Locations:** {scale['locations']}\n"
+            if scale.get("customers"):
+                company_section += f"- **Customers:** {scale['customers']}\n"
+            if scale.get("revenue_indicator"):
+                company_section += f"- **Revenue Indicator:** {scale['revenue_indicator']}\n"
+            company_section += "\n"
+
+        # History
+        if company_intel.get("history"):
+            hist = company_intel["history"]
+            company_section += "### History\n\n"
+            if hist.get("founded"):
+                company_section += f"- **Founded:** {hist['founded']}\n"
+            if hist.get("ownership_type"):
+                company_section += f"- **Ownership:** {hist['ownership_type']}\n"
+            if hist.get("background"):
+                company_section += f"- {hist['background']}\n"
+            company_section += "\n"
+
+        # Recent News
+        if company_intel.get("recent_news"):
+            company_section += "### Recent News\n\n"
+            for news in company_intel["recent_news"]:
+                company_section += f"- {news}\n"
+            company_section += "\n"
+
+        # Strategic Priorities
+        if company_intel.get("strategic_priorities"):
+            company_section += "### Strategic Priorities\n\n"
+            for priority in company_intel["strategic_priorities"]:
+                company_section += f"- {priority}\n"
+            company_section += "\n"
+
+        # Sales Opportunities
+        if company_intel.get("sales_opportunities"):
+            company_section += "### Sales Opportunities\n\n"
+            for opp in company_intel["sales_opportunities"]:
+                company_section += f"- {opp}\n"
+            company_section += "\n"
+
+    # Build owner/decision maker section from Gemini person intel
     owner_section = ""
     if person_intel:
-        owner_section = "\n## Owner/Decision Maker Intel\n\n"
+        owner_section = "\n## Decision Maker Intel\n\n"
         if person_intel.get("bio"):
             owner_section += f"**Bio:** {person_intel['bio']}\n\n"
         if person_intel.get("linkedin_url") and person_intel["linkedin_url"] != "unavailable":
@@ -467,8 +802,8 @@ def generate_profile(
 | **Website** | {website} |
 | **Rating** | {rating} ({review_count} reviews) |
 | **Category** | {business_type} |
-
-## Company Background
+{company_section}
+## Supplementary Research
 
 {search_intel}
 {owner_section}
@@ -495,6 +830,207 @@ def save_profile(slug: str, profile: str) -> str:
     profile_path.write_text(profile)
 
     return f"data/leads/{slug}/profile.md"
+
+
+def save_lead(slug: str, story: str, data: Dict) -> tuple[str, str]:
+    """
+    Save both profile.md and data.yaml for a lead.
+
+    Args:
+        slug: URL-safe business name slug
+        story: Markdown content for profile.md
+        data: Dict to serialize as data.yaml
+
+    Returns:
+        Tuple of (profile_path, data_path)
+    """
+    profile_dir = DATA_DIR / slug
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save narrative profile
+    profile_path = profile_dir / "profile.md"
+    profile_path.write_text(story)
+
+    # Save structured data
+    data_path = profile_dir / "data.yaml"
+    with open(data_path, 'w') as f:
+        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    return f"data/leads/{slug}/profile.md", f"data/leads/{slug}/data.yaml"
+
+
+def generate_story_profile(
+    business: Dict,
+    search_story: str,
+    website_story: str,
+    search_data: Dict,
+    website_data: Dict,
+    person_intel: Optional[Dict[str, Any]] = None,
+    company_intel: Optional[Dict[str, Any]] = None
+) -> tuple[str, Dict, List[str]]:
+    """
+    Generate story-first profile and structured data.
+
+    Returns:
+        Tuple of (profile_markdown, structured_data_dict, quality_flags)
+    """
+    name = business.get("business_name", "Unknown Business")
+    address = business.get("address", "N/A")
+    phone = business.get("phone", "N/A")
+    website = business.get("website", "N/A")
+    rating = business.get("rating", "N/A")
+    review_count = business.get("review_count", 0)
+    business_type = business.get("business_type", "N/A")
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Quality flags based on new criteria
+    quality_flags = []
+    if search_story and len(search_story) > 200:
+        quality_flags.append("story_complete")
+    if "conversation" in search_story.lower() or "?" in search_story:
+        quality_flags.append("hooks_found")
+    if search_data.get("leadership") or (company_intel and company_intel.get("leadership")):
+        quality_flags.append("leadership_identified")
+    if website_story and len(website_story) > 100:
+        quality_flags.append("website_analyzed")
+    if search_data.get("company") or search_data.get("services"):
+        quality_flags.append("structured_complete")
+
+    quality = "high" if len(quality_flags) >= 4 else "partial" if len(quality_flags) >= 2 else "minimal"
+
+    # Build The Story section
+    story_section = search_story if search_story else "No background story available."
+
+    # Build Business Operations section
+    operations_section = website_story if website_story else "Website not analyzed."
+
+    # Build conversation starters - extract from search_story or generate from data
+    conversation_starters = ""
+    if search_data.get("conversation_hooks"):
+        hooks = search_data["conversation_hooks"]
+        if hooks:
+            conversation_starters = "\n".join(f"{i+1}. {hook}" for i, hook in enumerate(hooks[:3]))
+
+    # Build Quick Reference from structured data
+    quick_ref_parts = []
+
+    # From search_data
+    if search_data.get("company", {}).get("founded"):
+        quick_ref_parts.append(f"- **Founded:** {search_data['company']['founded']}")
+
+    # Leadership
+    leaders = []
+    if search_data.get("leadership"):
+        for l in search_data["leadership"][:3]:
+            if l.get("name"):
+                leader_str = l["name"]
+                if l.get("role"):
+                    leader_str += f" ({l['role']})"
+                leaders.append(leader_str)
+    if leaders:
+        quick_ref_parts.append(f"- **Owners:** {', '.join(leaders)}")
+
+    # Team
+    team = []
+    combined_team = (search_data.get("team") or []) + (website_data.get("team") or [])
+    for t in combined_team[:5]:
+        if t.get("name"):
+            team_str = t["name"]
+            if t.get("role"):
+                team_str += f" ({t['role']})"
+            team.append(team_str)
+    if team:
+        quick_ref_parts.append(f"- **Team:** {', '.join(team)}")
+
+    # Location
+    quick_ref_parts.append(f"- **Location:** {address}")
+
+    # Services
+    services = search_data.get("services") or website_data.get("services") or []
+    if services:
+        quick_ref_parts.append(f"- **Services:** {', '.join(services[:5])}")
+
+    # Reputation
+    rep_parts = []
+    if rating and rating != "N/A":
+        rep_parts.append(f"{rating} stars")
+    if review_count:
+        rep_parts.append(f"{review_count} reviews")
+    if search_data.get("reputation", {}).get("signals"):
+        rep_parts.extend(search_data["reputation"]["signals"][:2])
+    if rep_parts:
+        quick_ref_parts.append(f"- **Reputation:** {', '.join(rep_parts)}")
+
+    quick_reference = "\n".join(quick_ref_parts) if quick_ref_parts else "- No structured data available"
+
+    # Build profile markdown
+    profile = f"""# {name}
+
+> **Scout Quality:** {quality} | **Scouted:** {timestamp}
+
+## The Story
+
+{story_section}
+
+## Conversation Starters
+
+{conversation_starters if conversation_starters else "1. (No specific hooks identified)"}
+
+## Quick Reference
+
+{quick_reference}
+
+## Business Operations
+
+{operations_section}
+
+---
+
+## Scout Metadata
+- **Quality Flags:** {', '.join(quality_flags) if quality_flags else 'none'}
+- **Sources:** SearxNG search, Playwright scraping, Gemini grounded search
+- **LLM:** Groq distillation + Gemini 2.0 Flash
+"""
+
+    # Build structured data dict for data.yaml
+    structured_data = {
+        "company": {
+            "name": name,
+            "founded": search_data.get("company", {}).get("founded"),
+            "acquired": search_data.get("company", {}).get("acquired"),
+            "location": {
+                "address": address,
+                "city": extract_city_from_address(address),
+                "state": "NM",  # Default, could be extracted
+                "zip": None
+            }
+        },
+        "leadership": search_data.get("leadership") or [],
+        "team": combined_team[:10],
+        "contact": {
+            "phone": phone,
+            "website": website,
+            "email": website_data.get("contact", {}).get("email")
+        },
+        "services": services[:20] if services else [],
+        "licenses": search_data.get("licenses") or [],
+        "reputation": {
+            "rating": rating if rating != "N/A" else None,
+            "review_count": review_count,
+            "signals": search_data.get("reputation", {}).get("signals") or [],
+            "differentiators": search_data.get("reputation", {}).get("differentiators") or []
+        },
+        "conversation_hooks": search_data.get("conversation_hooks") or [],
+        "metadata": {
+            "scouted_at": timestamp,
+            "quality": quality,
+            "quality_flags": quality_flags,
+            "sources": ["searxng", "playwright", "gemini"]
+        }
+    }
+
+    return profile, structured_data, quality_flags
 
 
 # ============================================================================
@@ -608,6 +1144,10 @@ def scout_lead(business: Dict, provider: str) -> tuple[bool, str]:
     """
     Scout a single business lead with deep research.
     Returns (success, quality).
+
+    Uses story-first distillation to produce both:
+    - profile.md (narrative for humans)
+    - data.yaml (structured for automation)
     """
     business_id = business.get("id")
     name = business.get("business_name", "Unknown")
@@ -617,66 +1157,102 @@ def scout_lead(business: Dict, provider: str) -> tuple[bool, str]:
     city = extract_city_from_address(address)
     logger.info(f"Scouting: {name} ({city})")
 
-    # Phase 1: Targeted searches
-    logger.info("  Phase 1: Gathering search intelligence...")
+    # Phase 1: Gemini company research (primary intelligence source)
+    logger.info("  Phase 1: Gemini company research...")
+    company_intel = research_company_with_gemini(name, f"{city}, NM")
+    if company_intel:
+        logger.info("    Company research successful")
+    else:
+        logger.info("    Company research returned no data")
+
+    # Phase 2: SearxNG searches (supplementary)
+    logger.info("  Phase 2: Gathering supplementary search intelligence...")
     search_intel = gather_search_intel(name, city)
 
-    # Phase 2: Distill search results
-    logger.info("  Phase 2: Distilling with Groq...")
-    search_distilled = distill_search_results(search_intel, provider)
+    # Phase 3a: Distill search results into story (narrative)
+    logger.info("  Phase 3a: Distilling search story...")
+    search_story = distill_search_story(search_intel, provider)
 
-    # Phase 3: Gemini person enrichment (if owner found)
+    # Phase 3b: Distill search results into structured data
+    logger.info("  Phase 3b: Distilling search structured...")
+    search_data = distill_search_structured(search_intel, provider)
+
+    # Phase 4: Gemini person enrichment (if owner found from company research or structured data)
     person_intel = None
-    search_text = search_distilled.get("search_intel", "")
-    owner_info = extract_owner_name(search_text)
-    if owner_info:
-        logger.info(f"  Phase 3: Enriching owner via Gemini: {owner_info['first']} {owner_info['last']}")
-        person_intel = enrich_person_with_gemini(
-            first=owner_info["first"],
-            last=owner_info["last"],
-            company=name,
-            location=city
-        )
-        if person_intel:
-            logger.info("    Gemini enrichment successful")
-        else:
-            logger.info("    Gemini enrichment returned no data")
-    else:
-        logger.info("  Phase 3: No owner name found to enrich")
+    # First try to get owner from Gemini company research
+    if company_intel and company_intel.get("leadership"):
+        leaders = company_intel["leadership"]
+        if leaders and len(leaders) > 0:
+            leader = leaders[0]
+            if leader.get("name"):
+                name_parts = leader["name"].split()
+                if len(name_parts) >= 2:
+                    first, last = name_parts[0], name_parts[-1]
+                    logger.info(f"  Phase 4: Enriching leader via Gemini: {first} {last}")
+                    person_intel = enrich_person_with_gemini(
+                        first=first,
+                        last=last,
+                        company=name,
+                        location=city
+                    )
+    # Fallback to extracting from structured data if no leader found
+    if not person_intel and search_data.get("leadership"):
+        leaders = search_data["leadership"]
+        if leaders and len(leaders) > 0:
+            leader = leaders[0]
+            if leader.get("name"):
+                name_parts = leader["name"].split()
+                if len(name_parts) >= 2:
+                    first, last = name_parts[0], name_parts[-1]
+                    logger.info(f"  Phase 4: Enriching owner via Gemini: {first} {last}")
+                    person_intel = enrich_person_with_gemini(
+                        first=first,
+                        last=last,
+                        company=name,
+                        location=city
+                    )
+                    if person_intel:
+                        logger.info("    Gemini enrichment successful")
+                    else:
+                        logger.info("    Gemini enrichment returned no data")
+    if not person_intel:
+        logger.info("  Phase 4: No owner name found to enrich")
 
-    # Phase 4: Scrape website
+    # Phase 5: Scrape website
     website_pages = {}
     if website:
-        logger.info(f"  Phase 4: Scraping website...")
+        logger.info(f"  Phase 5: Scraping website...")
         website_pages = scrape_website(website)
         logger.info(f"    Found {len(website_pages)} pages")
     else:
-        logger.info("  Phase 4: No website to scrape")
+        logger.info("  Phase 5: No website to scrape")
 
-    # Phase 5: Distill website content
-    website_distilled = {}
+    # Phase 6a: Distill website story
+    website_story = ""
     if website_pages:
-        logger.info("  Phase 5: Distilling website content...")
-        website_distilled = distill_website_content(website_pages, provider)
+        logger.info("  Phase 6a: Distilling website story...")
+        website_story = distill_website_story(website_pages, provider)
 
-    # Phase 6: Generate profile
+    # Phase 6b: Distill website structured data
+    website_data = {}
+    if website_pages:
+        logger.info("  Phase 6b: Distilling website structured...")
+        website_data = distill_website_structured(website_pages, provider)
+
+    # Phase 7: Generate story-first profile and structured data
     slug = slugify(name)
-    profile = generate_profile(business, search_distilled, website_distilled, person_intel)
+    profile, structured_data, quality_flags = generate_story_profile(
+        business, search_story, website_story, search_data, website_data,
+        person_intel, company_intel
+    )
 
-    # Determine quality
-    quality_score = 0
-    if search_distilled.get("search_intel"):
-        quality_score += 1
-    if person_intel:
-        quality_score += 1
-    if website_distilled.get("website_intel"):
-        quality_score += 1
+    # Determine quality from flags
+    quality = "high" if len(quality_flags) >= 4 else "partial" if len(quality_flags) >= 2 else "minimal"
 
-    quality = "high" if quality_score >= 2 else "partial" if quality_score == 1 else "minimal"
-
-    # Save profile
-    profile_path = save_profile(slug, profile)
+    # Save both profile.md and data.yaml
+    profile_path, data_path = save_lead(slug, profile, structured_data)
     logger.info(f"  Profile saved: {profile_path} (quality: {quality})")
+    logger.info(f"  Data saved: {data_path}")
 
     # Update database
     if update_scout_status(business_id, profile_path, quality):
