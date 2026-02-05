@@ -130,17 +130,35 @@ def search(query: str, num_results: int = 8) -> List[Dict[str, str]]:
         return []
 
 
-def gather_search_intel(business_name: str, city: str) -> Dict[str, List[Dict]]:
+def gather_search_intel(
+    business_name: str,
+    city: str,
+    employee_names: List[str] = None
+) -> Dict[str, List[Dict]]:
     """
     Run multiple targeted searches to gather intel.
     Returns dict with search categories.
+
+    If employee_names provided (from Places reviews), uses them for more
+    targeted ownership searches instead of generic queries.
     """
-    searches = {
-        "ownership": f'"{business_name}" owner OR founder OR CEO OR president {city}',
-        "history": f'"{business_name}" founded OR established OR history OR "since" {city}',
-        "services": f'"{business_name}" services OR products OR specializes {city}',
-        "reputation": f'"{business_name}" reviews OR awards OR certified {city}',
-    }
+    # Use shorter business name for searches (full name often too restrictive)
+    short_name = business_name.split(" - ")[0].split(" LLC")[0].split(" Inc")[0].strip()
+
+    searches = {}
+
+    # If we have employee names from Places, search for them specifically
+    if employee_names:
+        for emp_name in employee_names[:2]:  # Limit to top 2 to avoid rate limits
+            searches[f"person_{emp_name.lower().replace(' ', '_')}"] = \
+                f'"{emp_name}" "{short_name}" {city}'
+    else:
+        # Fallback to generic ownership search
+        searches["ownership"] = f'{short_name} owner OR founder OR CEO {city}'
+
+    # Always include these
+    searches["history"] = f'{short_name} founded OR established OR history {city}'
+    searches["services"] = f'{short_name} services OR products OR specializes {city}'
 
     intel = {}
     for category, query in searches.items():
@@ -150,6 +168,175 @@ def gather_search_intel(business_name: str, city: str) -> Dict[str, List[Dict]]:
         time.sleep(SEARCH_DELAY)
 
     return intel
+
+
+# ============================================================================
+# Google Places API
+# ============================================================================
+
+def search_place(business_name: str, address: str = None) -> Optional[str]:
+    """
+    Search for a business in Google Places and return place_id.
+    """
+    query = business_name
+    if address:
+        # Extract city from address for better matching
+        city_match = re.search(r',\s*([^,]+),\s*[A-Z]{2}', address)
+        if city_match:
+            query = f"{business_name} {city_match.group(1)}"
+
+    try:
+        response = requests.post(
+            f"{API_BASE}/places/search",
+            json={"query": query, "max_results": 1},
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("success") and data.get("places"):
+            return data["places"][0].get("place_id")
+        return None
+
+    except Exception as e:
+        logger.warning(f"Places search failed: {e}")
+        return None
+
+
+def get_place_details(place_id: str, include_reviews: bool = True) -> Optional[Dict]:
+    """
+    Get detailed information about a place including reviews.
+    """
+    try:
+        response = requests.post(
+            f"{API_BASE}/places/details",
+            json={"place_id": place_id, "include_reviews": include_reviews},
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("success"):
+            return data.get("place")
+        return None
+
+    except Exception as e:
+        logger.warning(f"Places details failed: {e}")
+        return None
+
+
+def extract_employees_from_reviews(reviews: List[Dict]) -> List[Dict[str, str]]:
+    """
+    Parse employee names mentioned in reviews.
+
+    Looks for patterns like:
+    - "worked with John" / "John was great"
+    - "technician Mike" / "Mike the technician"
+    - "Annette/Mike" (paired names)
+    - "office staff - Matt and Stephanie"
+    - Names followed by role indicators
+
+    Returns list of {name, role, context}
+    """
+    if not reviews:
+        return []
+
+    employees = []
+    seen_names = set()
+
+    # Common role indicators
+    role_patterns = [
+        (r'\b(technician|tech)\s+([A-Z][a-z]+)', 'technician'),
+        (r'([A-Z][a-z]+)\s+(?:the\s+)?(technician|tech)\b', 'technician'),
+        (r'([A-Z][a-z]+)\s+(?:was|is)\s+(?:our|the|my)\s+(technician|installer|plumber|electrician)', None),
+        (r'\b(installer|plumber|electrician)\s+([A-Z][a-z]+)', None),
+        (r'([A-Z][a-z]+)\s+(?:from|at)\s+(?:the\s+)?(?:front\s+)?(?:desk|office)', 'office'),
+        (r'office\s+(?:staff|personnel)[^.]*?([A-Z][a-z]+(?:\s+and\s+[A-Z][a-z]+)?)', 'office'),
+        (r'([A-Z][a-z]+)\s+(?:and|&)\s+([A-Z][a-z]+)\s+(?:were|are|was)', None),
+        (r'([A-Z][a-z]+)\s+solved|fixed|helped|installed|replaced', 'service'),
+        (r'(?:sales|salesperson|rep)[^.]*?([A-Z][a-z]+)', 'sales'),
+        (r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*[-–—]\s*(?:Owner|Manager|President|CEO)', 'owner'),
+        (r'(?:owner|manager)[^.]*?([A-Z][a-z]+)', 'management'),
+    ]
+
+    for review in reviews:
+        text = review.get("text", "")
+        if not text:
+            continue
+
+        # Check each pattern
+        for pattern, default_role in role_patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                groups = match.groups()
+                # Find the name group (capitalized word)
+                for g in groups:
+                    if g and re.match(r'^[A-Z][a-z]+', g):
+                        name = g.strip()
+                        # Handle "Matt and Stephanie" style
+                        if ' and ' in name.lower():
+                            parts = re.split(r'\s+and\s+', name, flags=re.IGNORECASE)
+                            for part in parts:
+                                part = part.strip()
+                                if part and part not in seen_names:
+                                    seen_names.add(part)
+                                    employees.append({
+                                        "name": part,
+                                        "role": default_role or "staff",
+                                        "context": text[:100] + "..." if len(text) > 100 else text
+                                    })
+                        elif name not in seen_names and len(name) > 2:
+                            # Filter out common false positives (pronouns, articles, adjectives)
+                            if name.lower() not in ['the', 'they', 'this', 'that', 'very', 'great', 'good',
+                                                    'our', 'your', 'their', 'his', 'her', 'my', 'its']:
+                                seen_names.add(name)
+                                employees.append({
+                                    "name": name,
+                                    "role": default_role or "staff",
+                                    "context": text[:100] + "..." if len(text) > 100 else text
+                                })
+                        break
+
+    return employees
+
+
+def gather_places_intel(business_name: str, address: str = None) -> Dict[str, Any]:
+    """
+    Gather intelligence from Google Places API.
+    Returns structured data including extracted employee names from reviews.
+    """
+    logger.info("  Searching Places API...")
+    place_id = search_place(business_name, address)
+
+    if not place_id:
+        logger.info("    No place found")
+        return {}
+
+    logger.info(f"    Found place_id: {place_id[:20]}...")
+    details = get_place_details(place_id, include_reviews=True)
+
+    if not details:
+        logger.info("    Could not fetch details")
+        return {}
+
+    # Extract employees from reviews
+    reviews = details.get("reviews", [])
+    employees = extract_employees_from_reviews(reviews)
+    if employees:
+        logger.info(f"    Extracted {len(employees)} employee names from reviews")
+
+    return {
+        "place_id": place_id,
+        "rating": details.get("rating"),
+        "review_count": details.get("rating_count"),
+        "business_status": details.get("business_status"),
+        "hours": details.get("hours"),
+        "types": details.get("types", []),
+        "reviews": reviews,
+        "employees_from_reviews": employees,
+        "address_components": details.get("address_components", {}),
+        "google_maps_url": details.get("google_maps_url"),
+    }
 
 
 # ============================================================================
@@ -866,7 +1053,8 @@ def generate_story_profile(
     search_data: Dict,
     website_data: Dict,
     person_intel: Optional[Dict[str, Any]] = None,
-    company_intel: Optional[Dict[str, Any]] = None
+    company_intel: Optional[Dict[str, Any]] = None,
+    places_intel: Optional[Dict[str, Any]] = None
 ) -> tuple[str, Dict, List[str]]:
     """
     Generate story-first profile and structured data.
@@ -882,10 +1070,21 @@ def generate_story_profile(
     review_count = business.get("review_count", 0)
     business_type = business.get("business_type", "N/A")
 
+    # Override with Places data if available (more reliable)
+    if places_intel:
+        if places_intel.get("rating"):
+            rating = places_intel["rating"]
+        if places_intel.get("review_count"):
+            review_count = places_intel["review_count"]
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Quality flags based on new criteria
     quality_flags = []
+    if places_intel and places_intel.get("reviews"):
+        quality_flags.append("places_enriched")
+    if places_intel and places_intel.get("employees_from_reviews"):
+        quality_flags.append("employees_identified")
     if search_story and len(search_story) > 200:
         quality_flags.append("story_complete")
     if "conversation" in search_story.lower() or "?" in search_story:
@@ -964,6 +1163,13 @@ def generate_story_profile(
 
     quick_reference = "\n".join(quick_ref_parts) if quick_ref_parts else "- No structured data available"
 
+    # Build sources list based on what was actually used
+    sources = []
+    if places_intel:
+        sources.append("google_places")
+    sources.append("searxng")
+    sources.append("playwright")
+
     # Build profile markdown
     profile = f"""# {name}
 
@@ -989,9 +1195,26 @@ def generate_story_profile(
 
 ## Scout Metadata
 - **Quality Flags:** {', '.join(quality_flags) if quality_flags else 'none'}
-- **Sources:** SearxNG search, Playwright scraping, Gemini grounded search
-- **LLM:** Groq distillation + Gemini 2.0 Flash
+- **Sources:** {', '.join(sources)}
+- **LLM:** Groq distillation
 """
+
+    # Merge employees from Places reviews into team
+    places_employees = []
+    if places_intel and places_intel.get("employees_from_reviews"):
+        places_employees = [
+            {"name": e["name"], "role": e.get("role", "staff"), "source": "places_reviews"}
+            for e in places_intel["employees_from_reviews"]
+        ]
+
+    all_team = places_employees + combined_team
+    # Deduplicate by name
+    seen_names = set()
+    unique_team = []
+    for member in all_team:
+        if member.get("name") and member["name"] not in seen_names:
+            seen_names.add(member["name"])
+            unique_team.append(member)
 
     # Build structured data dict for data.yaml
     structured_data = {
@@ -1007,7 +1230,7 @@ def generate_story_profile(
             }
         },
         "leadership": search_data.get("leadership") or [],
-        "team": combined_team[:10],
+        "team": unique_team[:15],
         "contact": {
             "phone": phone,
             "website": website,
@@ -1021,12 +1244,19 @@ def generate_story_profile(
             "signals": search_data.get("reputation", {}).get("signals") or [],
             "differentiators": search_data.get("reputation", {}).get("differentiators") or []
         },
+        "places": {
+            "place_id": places_intel.get("place_id") if places_intel else None,
+            "business_status": places_intel.get("business_status") if places_intel else None,
+            "hours": places_intel.get("hours") if places_intel else None,
+            "types": places_intel.get("types") if places_intel else [],
+            "google_maps_url": places_intel.get("google_maps_url") if places_intel else None,
+        } if places_intel else None,
         "conversation_hooks": search_data.get("conversation_hooks") or [],
         "metadata": {
             "scouted_at": timestamp,
             "quality": quality,
             "quality_flags": quality_flags,
-            "sources": ["searxng", "playwright", "gemini"]
+            "sources": sources
         }
     }
 
@@ -1148,6 +1378,14 @@ def scout_lead(business: Dict, provider: str) -> tuple[bool, str]:
     Uses story-first distillation to produce both:
     - profile.md (narrative for humans)
     - data.yaml (structured for automation)
+
+    Pipeline order:
+    1. Places API (reliable, structured, reviews with employee names)
+    2. SearxNG searches (uses employee names from Places for targeted queries)
+    3. Groq distillation (story + structured)
+    4. Website scraping
+    5. Website distillation
+    6. Profile generation
     """
     business_id = business.get("id")
     name = business.get("business_name", "Unknown")
@@ -1157,17 +1395,26 @@ def scout_lead(business: Dict, provider: str) -> tuple[bool, str]:
     city = extract_city_from_address(address)
     logger.info(f"Scouting: {name} ({city})")
 
-    # Phase 1: Gemini company research (primary intelligence source)
-    logger.info("  Phase 1: Gemini company research...")
-    company_intel = research_company_with_gemini(name, f"{city}, NM")
-    if company_intel:
-        logger.info("    Company research successful")
+    # Phase 1: Google Places API (PRIMARY - reliable, structured data)
+    logger.info("  Phase 1: Google Places API...")
+    places_intel = gather_places_intel(name, address)
+    if places_intel:
+        logger.info(f"    Places data: {places_intel.get('rating')}★, {places_intel.get('review_count')} reviews")
+        employees = places_intel.get("employees_from_reviews", [])
+        if employees:
+            logger.info(f"    Employees from reviews: {', '.join(e['name'] for e in employees[:5])}")
     else:
-        logger.info("    Company research returned no data")
+        logger.info("    No Places data found")
 
-    # Phase 2: SearxNG searches (supplementary)
-    logger.info("  Phase 2: Gathering supplementary search intelligence...")
-    search_intel = gather_search_intel(name, city)
+    # Phase 2: SearxNG searches (supplementary - use employee names if available)
+    logger.info("  Phase 2: Gathering search intelligence...")
+    # Build targeted queries using employee names from Places reviews
+    employee_names = []
+    if places_intel and places_intel.get("employees_from_reviews"):
+        employee_names = [e["name"] for e in places_intel["employees_from_reviews"]
+                        if e.get("role") in ("owner", "management", "sales", None)][:3]
+
+    search_intel = gather_search_intel(name, city, employee_names=employee_names)
 
     # Phase 3a: Distill search results into story (narrative)
     logger.info("  Phase 3a: Distilling search story...")
@@ -1177,26 +1424,12 @@ def scout_lead(business: Dict, provider: str) -> tuple[bool, str]:
     logger.info("  Phase 3b: Distilling search structured...")
     search_data = distill_search_structured(search_intel, provider)
 
-    # Phase 4: Gemini person enrichment (if owner found from company research or structured data)
+    # Gemini is deprioritized - manual enrichment for TOP 50 leads only
+    company_intel = None
     person_intel = None
-    # First try to get owner from Gemini company research
-    if company_intel and company_intel.get("leadership"):
-        leaders = company_intel["leadership"]
-        if leaders and len(leaders) > 0:
-            leader = leaders[0]
-            if leader.get("name"):
-                name_parts = leader["name"].split()
-                if len(name_parts) >= 2:
-                    first, last = name_parts[0], name_parts[-1]
-                    logger.info(f"  Phase 4: Enriching leader via Gemini: {first} {last}")
-                    person_intel = enrich_person_with_gemini(
-                        first=first,
-                        last=last,
-                        company=name,
-                        location=city
-                    )
-    # Fallback to extracting from structured data if no leader found
-    if not person_intel and search_data.get("leadership"):
+
+    # Try to enrich leadership from structured data if found
+    if search_data.get("leadership"):
         leaders = search_data["leadership"]
         if leaders and len(leaders) > 0:
             leader = leaders[0]
@@ -1243,7 +1476,7 @@ def scout_lead(business: Dict, provider: str) -> tuple[bool, str]:
     slug = slugify(name)
     profile, structured_data, quality_flags = generate_story_profile(
         business, search_story, website_story, search_data, website_data,
-        person_intel, company_intel
+        person_intel, company_intel, places_intel
     )
 
     # Determine quality from flags
