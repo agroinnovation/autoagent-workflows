@@ -1086,7 +1086,7 @@ def fetch_leads(
 ) -> List[Dict]:
     """Fetch high-value leads from database."""
 
-    conditions = ["rating >= 4.5", "review_count >= 10", "scout_status = 'pending'"]
+    conditions = ["rating >= 4.5", "review_count >= 10", "scout_status = 'pending'", "is_sales_target = true"]
 
     if business_id:
         conditions = [f"id = {business_id}"]
