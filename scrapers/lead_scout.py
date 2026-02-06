@@ -3,10 +3,10 @@
 Lead Scouting Pipeline v2
 
 Deep research on business leads using:
-- SearxNG: Targeted searches (ownership, history, services)
+- Serper: Google Search API for targeted queries
 - Playwright: Website scraping (/about, /team, /contact)
 - Groq/Ollama: LLM distillation of raw content into structured facts
-- Gemini: Person enrichment with Google Search grounding
+- Google Places: Business details and review mining
 
 Usage:
     python3 lead_scout.py --help           # Show help
@@ -422,103 +422,6 @@ def scrape_website(base_url: str) -> Dict[str, str]:
 
 
 # ============================================================================
-# Gemini Person Enrichment
-# ============================================================================
-
-def extract_owner_name(search_intel: str) -> Optional[Dict[str, str]]:
-    """
-    Extract owner/founder name from distilled search intel.
-    Returns dict with first, last, title if found.
-    """
-    if not search_intel:
-        return None
-
-    # Look for patterns like "Martin Calfee – Founder" or "John Smith, CEO"
-    patterns = [
-        r'\*\*Owner/Founder\*\*:\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)\s*[–\-—]\s*(\w+)',
-        r'\*\*Owner/Founder\*\*:\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)',
-        r'([A-Z][a-z]+)\s+([A-Z][a-z]+)\s*[–\-—]\s*(Founder|Owner|CEO|President|Chairman)',
-        r'(founder|owner|ceo|president):\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, search_intel, re.IGNORECASE)
-        if match:
-            groups = match.groups()
-            if len(groups) >= 2:
-                return {
-                    "first": groups[0],
-                    "last": groups[1],
-                    "title": groups[2] if len(groups) > 2 else "Owner"
-                }
-
-    return None
-
-
-def enrich_person_with_gemini(
-    first: str,
-    last: str,
-    company: str,
-    location: str = "Albuquerque, NM"
-) -> Optional[Dict[str, Any]]:
-    """
-    Use Gemini 2.0 Flash with Google Search grounding to enrich person info.
-    """
-    try:
-        response = requests.post(
-            f"{API_BASE}/gemini/enrich",
-            json={
-                "first": first,
-                "last": last,
-                "company": company,
-                "location": location
-            },
-            timeout=60
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        # Check if we got useful data
-        if data.get("bio") or data.get("recent_milestones"):
-            return data
-        return None
-
-    except Exception as e:
-        logger.warning(f"Gemini enrichment failed: {e}")
-        return None
-
-
-def research_company_with_gemini(
-    company: str,
-    location: str = "Albuquerque, NM"
-) -> Optional[Dict[str, Any]]:
-    """
-    Use Gemini 2.0 Flash with Google Search grounding for company research.
-    Returns leadership, scale, history, news, priorities, and sales opportunities.
-    """
-    try:
-        response = requests.post(
-            f"{API_BASE}/gemini/research-company",
-            json={
-                "company": company,
-                "location": location
-            },
-            timeout=120
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        # Check if we got useful data
-        if data.get("leadership") or data.get("summary") or data.get("scale"):
-            return data
-        return None
-
-    except Exception as e:
-        logger.warning(f"Gemini company research failed: {e}")
-        return None
-
-
-# ============================================================================
 # LLM Distillation
 # ============================================================================
 
@@ -857,8 +760,6 @@ def generate_profile(
     business: Dict,
     search_distilled: Dict[str, str],
     website_distilled: Dict[str, str],
-    person_intel: Optional[Dict[str, Any]] = None,
-    company_intel: Optional[Dict[str, Any]] = None
 ) -> str:
     """Generate rich markdown profile from distilled intel."""
 
@@ -877,101 +778,12 @@ def generate_profile(
 
     # Determine quality score based on what we found
     quality_flags = []
-    if company_intel:
-        quality_flags.append("gemini_research")
     if search_intel and search_intel != "No search intelligence gathered.":
         quality_flags.append("search_complete")
     if website_intel and website_intel != "Website not analyzed.":
         quality_flags.append("website_complete")
-    if person_intel:
-        quality_flags.append("owner_enriched")
 
     quality = "high" if len(quality_flags) >= 2 else "partial" if quality_flags else "minimal"
-
-    # Build company research section from Gemini
-    company_section = ""
-    if company_intel:
-        company_section = "\n## Company Intelligence (Gemini Research)\n\n"
-
-        # Summary
-        if company_intel.get("summary"):
-            company_section += f"{company_intel['summary']}\n\n"
-
-        # Leadership
-        if company_intel.get("leadership"):
-            company_section += "### Leadership\n\n"
-            for leader in company_intel["leadership"]:
-                leader_name = leader.get("name", "Unknown")
-                leader_title = leader.get("title", "")
-                leader_bg = leader.get("background", "")
-                company_section += f"- **{leader_name}** - {leader_title}"
-                if leader_bg:
-                    company_section += f" ({leader_bg})"
-                company_section += "\n"
-            company_section += "\n"
-
-        # Scale
-        if company_intel.get("scale"):
-            scale = company_intel["scale"]
-            company_section += "### Scale & Footprint\n\n"
-            if scale.get("employees"):
-                company_section += f"- **Employees:** {scale['employees']}\n"
-            if scale.get("locations"):
-                company_section += f"- **Locations:** {scale['locations']}\n"
-            if scale.get("customers"):
-                company_section += f"- **Customers:** {scale['customers']}\n"
-            if scale.get("revenue_indicator"):
-                company_section += f"- **Revenue Indicator:** {scale['revenue_indicator']}\n"
-            company_section += "\n"
-
-        # History
-        if company_intel.get("history"):
-            hist = company_intel["history"]
-            company_section += "### History\n\n"
-            if hist.get("founded"):
-                company_section += f"- **Founded:** {hist['founded']}\n"
-            if hist.get("ownership_type"):
-                company_section += f"- **Ownership:** {hist['ownership_type']}\n"
-            if hist.get("background"):
-                company_section += f"- {hist['background']}\n"
-            company_section += "\n"
-
-        # Recent News
-        if company_intel.get("recent_news"):
-            company_section += "### Recent News\n\n"
-            for news in company_intel["recent_news"]:
-                company_section += f"- {news}\n"
-            company_section += "\n"
-
-        # Strategic Priorities
-        if company_intel.get("strategic_priorities"):
-            company_section += "### Strategic Priorities\n\n"
-            for priority in company_intel["strategic_priorities"]:
-                company_section += f"- {priority}\n"
-            company_section += "\n"
-
-        # Sales Opportunities
-        if company_intel.get("sales_opportunities"):
-            company_section += "### Sales Opportunities\n\n"
-            for opp in company_intel["sales_opportunities"]:
-                company_section += f"- {opp}\n"
-            company_section += "\n"
-
-    # Build owner/decision maker section from Gemini person intel
-    owner_section = ""
-    if person_intel:
-        owner_section = "\n## Decision Maker Intel\n\n"
-        if person_intel.get("bio"):
-            owner_section += f"**Bio:** {person_intel['bio']}\n\n"
-        if person_intel.get("linkedin_url") and person_intel["linkedin_url"] != "unavailable":
-            owner_section += f"**LinkedIn:** {person_intel['linkedin_url']}\n\n"
-        if person_intel.get("recent_milestones"):
-            owner_section += "**Recent Milestones:**\n"
-            for milestone in person_intel["recent_milestones"]:
-                owner_section += f"- {milestone}\n"
-            owner_section += "\n"
-        if person_intel.get("ice_breaker"):
-            owner_section += f"**Outreach Angle:** {person_intel['ice_breaker']}\n"
 
     profile = f"""# {name}
 
@@ -986,11 +798,11 @@ def generate_profile(
 | **Website** | {website} |
 | **Rating** | {rating} ({review_count} reviews) |
 | **Category** | {business_type} |
-{company_section}
+
 ## Supplementary Research
 
 {search_intel}
-{owner_section}
+
 ## Business Operations
 
 {website_intel}
@@ -999,8 +811,8 @@ def generate_profile(
 
 ## Scout Metadata
 - **Quality Flags:** {', '.join(quality_flags) if quality_flags else 'none'}
-- **Sources:** SearxNG search, Gemini grounded search
-- **LLM:** Groq distillation + Gemini 2.0 Flash
+- **Sources:** Serper, Playwright, Groq
+- **LLM:** Groq distillation
 """
     return profile
 
@@ -1049,8 +861,6 @@ def generate_story_profile(
     website_story: str,
     search_data: Dict,
     website_data: Dict,
-    person_intel: Optional[Dict[str, Any]] = None,
-    company_intel: Optional[Dict[str, Any]] = None,
     places_intel: Optional[Dict[str, Any]] = None
 ) -> tuple[str, Dict, List[str]]:
     """
@@ -1086,7 +896,7 @@ def generate_story_profile(
         quality_flags.append("story_complete")
     if "conversation" in search_story.lower() or "?" in search_story:
         quality_flags.append("hooks_found")
-    if search_data.get("leadership") or (company_intel and company_intel.get("leadership")):
+    if search_data.get("leadership"):
         quality_flags.append("leadership_identified")
     if website_story and len(website_story) > 100:
         quality_flags.append("website_analyzed")
@@ -1378,7 +1188,7 @@ def scout_lead(business: Dict, provider: str) -> tuple[bool, str]:
 
     Pipeline order:
     1. Places API (reliable, structured, reviews with employee names)
-    2. SearxNG searches (uses employee names from Places for targeted queries)
+    2. Serper searches (uses employee names from Places for targeted queries)
     3. Groq distillation (story + structured)
     4. Website scraping
     5. Website distillation
@@ -1421,59 +1231,32 @@ def scout_lead(business: Dict, provider: str) -> tuple[bool, str]:
     logger.info("  Phase 3b: Distilling search structured...")
     search_data = distill_search_structured(search_intel, provider)
 
-    # Gemini is deprioritized - manual enrichment for TOP 50 leads only
-    company_intel = None
-    person_intel = None
-
-    # Try to enrich leadership from structured data if found
-    if search_data.get("leadership"):
-        leaders = search_data["leadership"]
-        if leaders and len(leaders) > 0:
-            leader = leaders[0]
-            if leader.get("name"):
-                name_parts = leader["name"].split()
-                if len(name_parts) >= 2:
-                    first, last = name_parts[0], name_parts[-1]
-                    logger.info(f"  Phase 4: Enriching owner via Gemini: {first} {last}")
-                    person_intel = enrich_person_with_gemini(
-                        first=first,
-                        last=last,
-                        company=name,
-                        location=city
-                    )
-                    if person_intel:
-                        logger.info("    Gemini enrichment successful")
-                    else:
-                        logger.info("    Gemini enrichment returned no data")
-    if not person_intel:
-        logger.info("  Phase 4: No owner name found to enrich")
-
-    # Phase 5: Scrape website
+    # Phase 4: Scrape website
     website_pages = {}
     if website:
-        logger.info(f"  Phase 5: Scraping website...")
+        logger.info(f"  Phase 4: Scraping website...")
         website_pages = scrape_website(website)
         logger.info(f"    Found {len(website_pages)} pages")
     else:
-        logger.info("  Phase 5: No website to scrape")
+        logger.info("  Phase 4: No website to scrape")
 
-    # Phase 6a: Distill website story
+    # Phase 5a: Distill website story
     website_story = ""
     if website_pages:
-        logger.info("  Phase 6a: Distilling website story...")
+        logger.info("  Phase 5a: Distilling website story...")
         website_story = distill_website_story(website_pages, provider)
 
-    # Phase 6b: Distill website structured data
+    # Phase 5b: Distill website structured data
     website_data = {}
     if website_pages:
-        logger.info("  Phase 6b: Distilling website structured...")
+        logger.info("  Phase 5b: Distilling website structured...")
         website_data = distill_website_structured(website_pages, provider)
 
-    # Phase 7: Generate story-first profile and structured data
+    # Phase 6: Generate story-first profile and structured data
     slug = slugify(name)
     profile, structured_data, quality_flags = generate_story_profile(
         business, search_story, website_story, search_data, website_data,
-        person_intel, company_intel, places_intel
+        places_intel
     )
 
     # Determine quality from flags
