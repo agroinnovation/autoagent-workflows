@@ -55,6 +55,7 @@ LLM_STORY_TEMP = 0.35  # Higher temp for narrative creativity
 LLM_EXTRACT_TEMP = 0.1  # Low temp for deterministic extraction
 LLM_MAX_TOKENS = 1500
 LLM_STORY_MAX_TOKENS = 2000  # Allow longer story responses
+LLM_DELAY = 60  # seconds between LLM calls (Groq free tier: 8K TPM for gpt-oss-120b)
 
 # Logging setup
 logging.basicConfig(
@@ -464,7 +465,11 @@ def distill_with_llm(
 
         choices = data.get("choices", [])
         if choices:
-            return choices[0].get("message", {}).get("content", "")
+            result = choices[0].get("message", {}).get("content", "")
+            if result and LLM_DELAY > 0:
+                logger.info(f"    Rate limit pause ({LLM_DELAY}s)...")
+                time.sleep(LLM_DELAY)
+            return result
         return None
 
     except Exception as e:
